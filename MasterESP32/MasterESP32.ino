@@ -26,10 +26,10 @@
 const uint8_t channel = 1;
 const uint8_t NumberOfNodes = 6;  // enter number of node (esp8266) you want to connect
 // --- Replace with your network credentials ---
-const char *http_username = "admin";
-const char *http_password = "home";
-const char *ssid = "vivo y15";                         //"vivo Y300 5G";  // "Galaxy A21s8DB5"   //
-const char *password = "12367890";                     // "alkc2049"  //"12367890";
+const char *http_username = "admin";         // username for login on webpage 
+const char *http_password = "home";          // password for login on webpage
+const char *ssid = "WifiName";               //Name of your WiFi  
+const char *password = "12367890";           // Password of your WiFi
 char hmac_key[] = "HashkeyShouldBeExcatly32letter12";  // must change the key for better security (Should must Be Excatly 32 letter including spaces)
 
 
@@ -567,3 +567,4 @@ void loop() {
 
 
 // void serverRouter() { }
+
