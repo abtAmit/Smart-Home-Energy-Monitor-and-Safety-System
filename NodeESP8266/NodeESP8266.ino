@@ -1,9 +1,10 @@
+#include <Arduino.h>
 #include <SHA256.h>
 #include <espnow.h>
 #include <ESP8266WiFi.h>
 //#include <esp_wifi.h>
 #include <EEPROM.h>
-const uint8_t channel = 11;
+const uint8_t channel = 0;
 //---------------------------------User Configuration Start-----------------------------------------------
 #define numberOfSwitch 5                               // number of switches you want to use
 const uint8_t deviceId = 101;                          // must be different for every esp8266 (must be like 101,102.......106)
@@ -14,13 +15,21 @@ char hmac_key[] = "HashkeyShouldBeExcatly32letter12";  // must change the key fo
 #define off HIGH  // for relay using active low
 #define on LOW
 
-
+#define CHANNEL_COUNT 1
 
 // -----------------------------------------------User Configuration END------------------------------------
+//----------------------------------------------Advanced Configuration----------------------------------------------
+
+// --- triac Config ---
+#define TRIAC_PIN D8    
+#define ZCD_PIN   D3    
+
+#define AC_FREQUENCY 50  // 50Hz
 // Shift Register
-#define latchPin 5  // 1 // rx tx in use during testing
-#define clockPin 4  // 15
-#define dataPin 16  // 3
+#define latchPin 5  // D1
+#define clockPin 4  // D2
+#define dataPin 16  // D0
+//----------------------------------------------Advanced Configuration END----------------------------------------------
 
 // time
 unsigned long currentMillis = 0;
@@ -28,6 +37,8 @@ unsigned long previousMillis = 0;
 unsigned long ct = 0;
 unsigned long pt = 0;
 unsigned long st = 0;
+bool espSwitchflag = 0;
+volatile bool packetReceivedFlag = false; // Flag to tell loop we have data
 
 const unsigned int interval = 60000;  // 10seconds
 uint16_t gtime = 0;
@@ -152,8 +163,8 @@ uint8_t dpin[] = {
   // pin map
   /*  16,  // D0
   5,   // D1
-  4,   // D2*/
-  0,   // D3
+  4,   // D2
+  0,   // D3*/
   2,   // D4
   14,  // D5
   12,  // D6
@@ -184,6 +195,170 @@ void hashData(void* structaddress, uint8_t length, uint8_t* hash) {  // hash dat
   //  return &hash[0];
 }
 
+//---------------------triac controll code start------------------------
+// --- Debug Counters ---
+volatile unsigned long debug_zcd_counter = 0;
+volatile unsigned long debug_timer_counter = 0;
+unsigned long last_debug_print = 0;
+
+// --- GAMMA CORRECTION TABLE ---
+// This maps 0-100% perceived brightness to 0-100% timer values.
+// It creates a curve: slow changes at the bottom, fast at the top.
+const uint8_t gamma_table[] = {
+  0, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+  2, 2, 2, 2, 2, 2, 3, 3, 3, 3,
+  4, 4, 4, 5, 5, 5, 6, 6, 6, 7,
+  7, 8, 8, 9, 9, 10, 10, 11, 12, 12,
+  13, 14, 15, 15, 16, 17, 18, 19, 20, 21,
+  22, 23, 24, 25, 26, 27, 28, 29, 31, 32,
+  33, 35, 36, 38, 39, 41, 42, 44, 46, 48,
+  50, 52, 54, 56, 58, 60, 62, 65, 67, 70,
+  72, 75, 78, 81, 84, 87, 90, 93, 96, 100,
+  104, 108, 112, 116, 120, 125, 130, 135, 140, 145, 150  // Extended slightly
+};
+
+// --- Channel Structs ---
+struct SmartChannel {
+  uint8_t triacPin;
+  bool isDimmer;
+  bool state;
+  uint8_t brightness;  // 0-100
+};
+
+SmartChannel g_channels[CHANNEL_COUNT];
+
+// --- Firing Queue ---
+struct FiringEvent {
+  uint8_t pin;
+  uint16_t delayMicros;
+};
+
+volatile FiringEvent g_fireQueue[CHANNEL_COUNT];
+volatile int g_fireQueueCount = 0;
+volatile int g_fireQueueIndex = 0;
+
+// --- 1. The Executor (Timer1 ISR) ---
+void ICACHE_RAM_ATTR onTimer1_ISR() {
+  debug_timer_counter++;
+
+  // 1. Fire the TRIAC
+  int currentPin = g_fireQueue[g_fireQueueIndex].pin;
+  digitalWrite(currentPin, HIGH);
+  delayMicroseconds(100);
+  digitalWrite(currentPin, LOW);
+
+  // 2. Move to next
+  g_fireQueueIndex++;
+
+  // 3. Queue finished?
+  if (g_fireQueueIndex >= g_fireQueueCount) {
+    timer1_disable();
+  } else {
+    // 4. Re-arm timer
+    uint16_t nextDelay = g_fireQueue[g_fireQueueIndex].delayMicros;
+    uint16_t prevDelay = g_fireQueue[g_fireQueueIndex - 1].delayMicros;
+    uint16_t delayDiff = nextDelay - prevDelay;
+
+    timer1_write(delayDiff * 5);
+  }
+}
+
+// --- 2. The Scheduler (ZCD ISR) ---
+void ICACHE_RAM_ATTR onZCD_ISR() {
+  debug_zcd_counter++;
+
+  g_fireQueueCount = 0;
+  g_fireQueueIndex = 0;
+
+  for (int i = 0; i < CHANNEL_COUNT; i++) {
+    // Skip if OFF or 0%
+    if (g_channels[i].state == false || g_channels[i].isDimmer == false || g_channels[i].brightness == 0) {
+      continue;
+    }
+
+    // --- NEW LOGIC: GAMMA CORRECTION ---
+    // 1. Get gamma-corrected value (0-150 range from table)
+    // We map 0-100 input to index 0-100 of the table
+    int index = g_channels[i].brightness;
+    if (index > 100) index = 100;
+
+    uint8_t corrected_val = pgm_read_byte(&gamma_table[index]);
+
+    uint16_t delay = map(g_channels[i].brightness, 1, 100, 9600, 200);
+
+    g_fireQueue[g_fireQueueCount].pin = g_channels[i].triacPin;
+    g_fireQueue[g_fireQueueCount].delayMicros = delay;
+    g_fireQueueCount++;
+  }
+
+  if (g_fireQueueCount == 0) {
+    timer1_disable();
+    return;
+  }
+
+  // Bubble Sort
+  for (int i = 0; i < g_fireQueueCount - 1; i++) {
+    for (int j = 0; j < g_fireQueueCount - i - 1; j++) {
+      if (g_fireQueue[j].delayMicros > g_fireQueue[j + 1].delayMicros) {
+        // Manual Swap
+        uint8_t tempPin = g_fireQueue[j].pin;
+        uint16_t tempDelay = g_fireQueue[j].delayMicros;
+        g_fireQueue[j].pin = g_fireQueue[j + 1].pin;
+        g_fireQueue[j].delayMicros = g_fireQueue[j + 1].delayMicros;
+        g_fireQueue[j + 1].pin = tempPin;
+        g_fireQueue[j + 1].delayMicros = tempDelay;
+      }
+    }
+  }
+
+  timer1_enable(TIM_DIV16, TIM_EDGE, TIM_SINGLE);
+  timer1_write(g_fireQueue[0].delayMicros * 5);
+}
+
+//-------------------------------triac control code ends-----------------------------------
+/*
+//---------------------triac controll code start------------------------
+// --- State Variables ---
+volatile int g_brightness = 0; 
+volatile bool g_state = true;   
+
+// --- DEBUG COUNTERS ---
+// We use these to see if the interrupts are actually running
+volatile unsigned long debug_zcd_counter = 0;
+volatile unsigned long debug_timer_counter = 0;
+
+// --- 1. The Executor (Timer1 ISR) ---
+void ICACHE_RAM_ATTR onTimer1_ISR() {
+  // Fire the pulse
+  digitalWrite(TRIAC_PIN, HIGH);
+  delayMicroseconds(100); 
+  digitalWrite(TRIAC_PIN, LOW);
+  
+  // Increment debug counter
+  debug_timer_counter++;
+}
+
+// --- 2. The Scheduler (ZCD ISR) ---
+void ICACHE_RAM_ATTR onZCD_ISR() {
+  // Increment debug counter
+  debug_zcd_counter++;
+
+  // 1. Check if we should fire at all
+  if (g_state == false || g_brightness == 0) {
+    timer1_disable(); // Turn it off if we don't need it
+    return;
+  }
+
+  // 2. Calculate delay (Map 1-100% to 8000-100us)
+  uint16_t delayMicros = map(g_brightness, 1, 100, 8000, 200);
+
+  // 3. FORCE ENABLE and Arm the timer
+  // We must ensure the timer is enabled before/when writing
+  timer1_enable(TIM_DIV16, TIM_EDGE, TIM_SINGLE); 
+  timer1_write(delayMicros * 5); 
+}
+//-------------------------------triac control code ends-----------------------------------
+*/
 void sendBeat() {
   // pol++;
   beat.id = deviceId;
@@ -202,10 +377,17 @@ void turnoff(uint8_t pin, uint8_t err = 0) {  // err off due to error
     Serial.print(dpin[pin]);
     Serial.print(" ");
     Serial.print("OFF pin D");
-    Serial.println(3+pinupd.pin);
+    Serial.println(pinupd.pin);
 
   } else if (pinSlider[pin] == 1) {
-    Serial.println("it is a slider pin");
+    Serial.print("it is a slider pin value:");
+    Serial.println(pinValue[pin]);
+    uint8_t brightness = map(pinValue[pin], 0, 255, 0, 100);
+    noInterrupts();
+    //g_state = false;
+    g_channels[0].state = false;
+    // g_channels[0].brightness = 0;  // turn off
+    interrupts();
 
     // need to complete // how will you turn dimmer off // saving pin state will change the dimmer
   }
@@ -219,18 +401,24 @@ void turnoff(uint8_t pin, uint8_t err = 0) {  // err off due to error
 
 void turnon(uint8_t pin) {
   if (emergencyStop) { return; }
-  digitalWrite(dpin[pin], off);
+  // digitalWrite(dpin[pin], off);
   Serial.print("Gpio pin ");
   Serial.print(dpin[pin]);
   Serial.print(" ");
   Serial.print("ON pin D");
-  Serial.println(3+pinupd.pin);
+  Serial.println(pinupd.pin);
   pinState[pin] = 1;
 
-  if (pinSlider[pin] == 0) {
+  if (pin != 14) {
     digitalWrite(dpin[pin], on);
-  } else {
-    Serial.println("it is a slider pin");
+  } else if (pinSlider[pin] == 14) {
+    Serial.print("it is a slider pin value:");
+    Serial.println(pinValue[pin]);
+    uint8_t brightness = map(pinValue[pin], 0, 255, 0, 100);
+    noInterrupts();
+    g_channels[0].state = pinState[pin];
+    g_channels[0].brightness = brightness;
+    interrupts();
   }
   //else if (pinSlider[pin] == 1 and pinValue[pin] > 5) {
   // manageDimmer(pin);
@@ -263,28 +451,45 @@ void sendAllState() {
 }
 void managepin(uint8_t pin) {
   Serial.println("managepin ");
-  if (pinState[pin] == 1) {
-    turnon(pin);
+  if (pinSlider[pin] == 0) {
+    if (pinState[pin] == 1) {
+      turnon(pin);
 
-  } else {
-    turnoff(pin);
+    } else {
+      turnoff(pin);
+    }
+    sendPinInfo(pin);
+
+    if (EEPROM.read((pin + 16)) != pinState[pin]) {
+      Serial.print("manage pin ");
+      Serial.print(pin);
+      Serial.print(" pin States ");
+      Serial.println(pinState[pin]);
+      EEPROM.write(pin + 16, pinState[pin]);
+      EEPROM.commit();
+    }
   }
-  sendPinInfo(pin);
-
-  if (EEPROM.read((pin + 16)) != pinState[pin]) {
-    Serial.print("manage pin ");
-    Serial.print(pin);
-    Serial.print(" pin States ");
-    Serial.println(pinState[pin]);
-    EEPROM.write(pin + 16, pinState[pin]);
-    EEPROM.commit();
+  if (pinSlider[pin] == 1) {
+    if (pinState[pin] == 0) {
+      noInterrupts();
+      g_channels[0].state = false;
+      // g_channels[0].brightness = 0;  // turn off
+      interrupts();
+    }
+    if (pinState[pin] == 1) {
+      uint8_t brightness = map(pinValue[pin], 0, 255, 0, 100);
+      noInterrupts();
+      g_channels[0].state = pinState[pin];
+      g_channels[0].brightness = brightness;
+      interrupts();
+    }
   }
   //EEPROM.write(pin + 16, pinState[pin]);
 }
 void mgsw() {
-  bool s1 = !digitalRead(16);
-  bool s2 = !digitalRead(5);
-  bool s3 = !digitalRead(4);
+  bool s1 = !digitalRead(12);
+  bool s2 = !digitalRead(13);
+  bool s3 = !digitalRead(14);
 
   if (s1 != switchArray[0]) {
     switchArray[0] = s1;
@@ -594,10 +799,17 @@ void onDataSent(uint8_t* mac, uint8_t status) {
                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
                 status == 0 ? "OK" : "FAIL");
 }
-void onDataRecv(uint8_t* mac, uint8_t* incomingData, uint8_t len) {
+uint8_t packetid = 0;
+uint8_t typ = 0;
+uint8_t incomingData[250];        // Buffer to store raw bytes
+uint8_t len = 0;            // Store length
+//uint8_t incomingMac[6];                   // Store sender MAC
+
+void onDataRecv(uint8_t* mac, uint8_t* incomingDataPacket, uint8_t lenth) {
   // Copy the received data into the myData structure
-  uint8_t packetid = 0;
-  uint8_t typ = 0;
+
+  memcpy(incomingData, incomingDataPacket, len);
+  len = lenth;
   lengt = len;
   memcpy(&typ, incomingData, 1);
   packetid = incomingData[1];
@@ -613,6 +825,11 @@ void onDataRecv(uint8_t* mac, uint8_t* incomingData, uint8_t len) {
       wifi_set_channel(incomingData[1]);
     }
   }
+  else {
+    packetReceivedFlag = true;
+  }
+}
+void processPacket() {
   if (packetid != deviceId) {
     for (uint8_t i = 0; i < noOfSlave; i++) {
       /* if (memcmp(mac, masterAddress, 6) == 0) {
@@ -632,7 +849,7 @@ void onDataRecv(uint8_t* mac, uint8_t* incomingData, uint8_t len) {
   }
   if (packetid == deviceId) {
     // Print a confirmation that data was received
-    Serial.println("\n -----------------");
+    /*Serial.println("\n -----------------");
     Serial.print("Packet received from: ");
     // Print the MAC address of the sender
     for (int i = 0; i < 6; i++) {
@@ -640,7 +857,7 @@ void onDataRecv(uint8_t* mac, uint8_t* incomingData, uint8_t len) {
       if (i < 5) {
         Serial.print(":");
       }
-    }
+    }*/
     Serial.print("TYpe");
     Serial.println(typ);
     if (typ == 2) {
@@ -669,7 +886,7 @@ void onDataRecv(uint8_t* mac, uint8_t* incomingData, uint8_t len) {
         Serial.print("pin converted to  ");
         Serial.println(pinupd.pin);
 
-        espSwitch();
+        espSwitchflag = 1;
       } else {
         Serial.println("---");
         Serial.print("!!! WARNING: Received packet with INVALID SIGNATURE ");
@@ -805,37 +1022,39 @@ void setup() {
   Serial.begin(115200);
   delay(2000);
   Serial.println("\n Hi from esp8266");
+  Serial.println("pin output ");
   for (uint i = 0; i < numberOfSwitch; i++) {
-    // if (pinSlider[i] == 0)
+    // triac pin also need to be decleared as output pin
     pinMode(dpin[i], OUTPUT);
-    Serial.println("pin output ");
-    Serial.println(dpin[i]);
-    Serial.println("------------------- ");
+    Serial.print(dpin[i]);
+    Serial.print(", ");
     digitalWrite(dpin[i], HIGH);
   }
+  Serial.println(" ");
 
- /* for (uint i = 0; i < numberOfSwitch; i++) {
+  for (uint i = 0; i < numberOfSwitch; i++) {
     digitalWrite(dpin[i], LOW);
-  }*/
+  }
   delay(1000);
   for (uint i = 0; i < numberOfSwitch; i++) {
+    if (dpin[i] == dpin[0])
+      continue;
     digitalWrite(dpin[i], HIGH);
   }
 
-/*
+
   pinMode(latchPin, OUTPUT);
   pinMode(clockPin, OUTPUT);
   pinMode(dataPin, INPUT);
-  */
   EEPROM.begin(128);  // Allocate 56 bytes of flash for EEPROM
 
   // delete after test
-   pinMode(16, INPUT_PULLUP);
+  /* pinMode(12, INPUT_PULLUP);
 
-  pinMode(5, INPUT_PULLUP);
+  pinMode(13, INPUT_PULLUP);
 
-  pinMode(4, INPUT_PULLUP);
-
+  pinMode(14, INPUT_PULLUP);
+ */
   //---------------------------------------------------------
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
@@ -864,9 +1083,25 @@ void setup() {
 
 
   fetchTime();
-  //--------------------------------------------------
+  //-------------------------------------------------- triac code
+
+  pinMode(TRIAC_PIN, OUTPUT);
+  digitalWrite(TRIAC_PIN, LOW);
+  pinMode(ZCD_PIN, INPUT_PULLUP);
+
+  // --- Timer Setup ---
+  timer1_attachInterrupt(onTimer1_ISR);
+  timer1_enable(TIM_DIV16, TIM_EDGE, TIM_SINGLE);
+  timer1_write(600000); 
+  timer1_disable();     
+
+  // --- ZCD Interrupt Setup ---
+  attachInterrupt(digitalPinToInterrupt(ZCD_PIN), onZCD_ISR, FALLING);
+  //-----------------------------------------
 
   // --- Load saved switch states ---
+  for (uint8_t i = 0; i < numberOfSwitch; i++) {
+  EEPROM.write(i,0);} 
   uint8_t addr = 0;
   for (uint8_t i = 0; i < numberOfSwitch; i++) {  // possibly break if any array have index more than 8
     pinSlider[i] = EEPROM.read(i);
@@ -875,12 +1110,12 @@ void setup() {
     switchArray[i] = EEPROM.read(i + 32);
     EEPROM.get(((i * 2) + 40), onTime[i]);  //  onTime[i] = EEPROM.read(i * 2 + 24);
     EEPROM.get(((i * 2) + 56), offTime[i]);
-
+    /*
     // for test only
     for (uint8_t i = 0; i < numberOfSwitch; i++) {
       pinSlider[i] = 0; // clear slider flag
     }
-
+*/
     //  offTime[i] = EEPROM.read(i * 2 + 40);
     managepin(i);  // set pin to stored value
   }
@@ -898,6 +1133,40 @@ void setup() {
   Serial.println(" ");
 }
 void loop() {
+
+  // Debug printer
+  if (millis() - last_debug_print > 1000) {
+    last_debug_print = millis();
+    Serial.printf("ZCD:%lu TMR:%lu CH0:%d%%\n",
+                  debug_zcd_counter, debug_timer_counter, g_channels[0].brightness);
+    debug_zcd_counter = 0;
+    debug_timer_counter = 0;
+  }
+
+  // Serial Input
+  if (Serial.available() > 0) {
+    if (isDigit(Serial.peek())) {
+      int brightness = Serial.parseInt();
+      while (Serial.available() > 0 && !isDigit(Serial.peek())) Serial.read();
+
+      if (brightness >= 0 && brightness <= 100) {
+        Serial.printf("Set CH0: %d%%\n", brightness);
+        noInterrupts();
+        g_channels[0].brightness = brightness;
+        interrupts();
+      }
+    } else {
+      Serial.read();
+    }
+  }
+  if (packetReceivedFlag == 1) {
+    packetReceivedFlag = 0;
+    processPacket();
+  }
+  if (espSwitchflag == 1) {
+    espSwitchflag = 0;
+    espSwitch();
+  }
   if (ackreceivedFlag == 1) {
     ackreceivedFlag = 0;
     slaveId[noofslavebridged] = bridreq.nodeId;
@@ -920,8 +1189,8 @@ void loop() {
   manageTime();
   ct = millis();
   if (ct - pt > 500) {
-   // manageSwitch();
-     mgsw();
+    manageSwitch();
+    // mgsw();
   }
 
   if (ct - st > 50000) {
