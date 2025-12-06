@@ -20,7 +20,9 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include "webpage.h"
-#include <EEPROM.h>
+#include "EEPROM.h"
+ #include "EmonLib.h"   
+
 //---------------------------------------------------------------User Configurable---------------------------
 #define pageName "smarthome"
 const uint8_t channel = 1;
@@ -31,7 +33,6 @@ const char *http_password = "home";          // password for login on webpage
 const char *ssid = "WifiName";               //Name of your WiFi  
 const char *password = "12367890";           // Password of your WiFi
 char hmac_key[] = "HashkeyShouldBeExcatly32letter12";  // must change the key for better security (Should must Be Excatly 32 letter including spaces)
-
 
 // --- !! IMPORTANT: CALIBRATION !! ---
 // You MUST tune these values for your specific hardware.
@@ -47,6 +48,7 @@ char hmac_key[] = "HashkeyShouldBeExcatly32letter12";  // must change the key fo
 #define I_CAL1 90.9
 #define I_CAL2 90.9
 #define I_CAL3 90.9
+EnergyMonitor emon1;
 
 // 3. Phase Shift Calibration (PHASE_CAL)
 // This corrects for timing shifts from the transformers.
@@ -62,22 +64,30 @@ const int daylightOffset_sec = 0;  // No DST in India
 
 // --- Define your ADC pins ---
 // Make sure these are ADC-capable pins on your ESP32-C6
-#define V_PIN 1  // ADC Pin for Voltage (from 12V transformer)
-#define I_PIN1 2 // ADC Pin for CT 1
+// #define V_PIN 1  // ADC Pin for Voltage (from 12V transformer)
+#define I_PIN1 5 // ADC Pin for CT 1
 #define I_PIN2 3 // ADC Pin for CT 2
 #define I_PIN3 4 // ADC Pin for CT 3
+const int VOLT_PIN = 1; 
+const int CURRENT_PIN = 2; // Choose your ADC pin for current
 
 // --- Create three EnergyMonitor objects ---
-EnergyMonitor emon1;
+
+/*EnergyMonitor emon1;
 EnergyMonitor emon2;
 EnergyMonitor emon3;
 
-
+*/
 
 
 
 // ------------------------------------
-// uint8_t LMK[16] = "ThisIsOurLMKKey";
+float realPower[NumberOfNodes]={0};
+float apparentPower[NumberOfNodes]={0};
+float powerFactor[NumberOfNodes]={0};
+float supplyVoltage   = 0;
+float Irms[NumberOfNodes]={0};
+ uint8_t LMK[16] = "ThisIsOurLMKKey";
 // Ticker sendBeats;
 // Ticker receiveBeats;
 void requestBridge(uint8_t);
@@ -113,15 +123,15 @@ nodeDetails nodeDet;
 uint8_t nodeMac[NumberOfNodes][6];
 
 uint8_t dpins[] = {
-  16,  // D0
+ /* 16,  // D0
   5,   // D1
-  4,   // D2
-  0,   // D3
+  4,   // D2*/
+ // 0,   // D3 
   2,   // D4
   14,  // D5
   12,  // D6
   13,  // D7
-       // 15, // D8  ---- Boot fails if pulled HIGH
+  15, // D8  ---- Boot fails if pulled HIGH
   3,   //rx
   1    //tx
 };
@@ -465,7 +475,7 @@ void setup() {
 
   // heartBeat();
   // sendBeats.attach(600, setFlag10Min);
-
+/*
   // --- Configure Monitor 1 ---
   // All monitors share the same voltage pin and calibration
   emon1.voltage(V_PIN, V_CAL, PHASE_CAL);
@@ -476,8 +486,22 @@ void setup() {
   emon2.current(I_PIN2, I_CAL2);
 
   // --- Configure Monitor 3 ---
-  emon3.voltage(V_PIN, V_CAL, PHASE_CAL);
+  //emon3.voltage(V_PIN, V_CAL, PHASE_CAL);
   emon3.current(I_PIN3, I_CAL3);
+
+  */
+  //---------------------------powermeasurement-----------------------
+    // 1. Configure ADC Resolution
+  analogReadResolution(12);
+
+  // 2. Initialize Voltage (Pin, Cal, Phase_Shift)
+  // Use your calibrated value from the previous step instead of 260.0 if you have it
+  emon1.voltage(VOLT_PIN, 27.15, 1.7); 
+
+  // 3. Initialize Current (Pin, Calibration)
+  // Theoretical Calibration: Turns Ratio (1000) / Burden (200) = 5.0
+  emon1.current(CURRENT_PIN, 5.0); 
+  //----------------------------------------------
 }
 void handle_physical_button(bool new_value) {
   uint8_t a_roomId = 101;
@@ -500,10 +524,45 @@ unsigned long pre = 0;
 unsigned long curr = 0;
 unsigned long preHeart = 0;
 bool heartbeatsentFlag = 0;
+bool f3=0;
+bool f2=0;
 void loop() {
+
   emon1.calcVI(20, 2000);
+
+  // 5. Extract Data
+   realPower[0]       = emon1.realPower; // Wattage
+   apparentPower[0]  = emon1.apparentPower;
+   powerFactor[0]   = emon1.powerFactor;
+   supplyVoltage   = emon1.Vrms;      // Voltage
+   Irms[0]      = emon1.Irms;      // Current
+if (Irms[0]>globalSettings.current){
+  overCurrent(101);
+  f2=1;
+}
+if (supplyVoltage>globalSettings.voltage){
+  overVoltage(101);
+}
+if(roomSettings[101].override!=0){
+if (Irms[0]>roomSettings[0].current){
+  overCurrent(101);
+  f3=1;
+}
+if (f3==1 and Irms[0]<roomSettings[0].current){
+   faultClear(101);
+  f3=0;
+}
+if (supplyVoltage>roomSettings[0].voltage){
+  overVoltage(101);
+}
+if (f2==1 and Irms[0]<globalSettings.current){
+   faultClear(101);
+  f2=0;
+}
+}
+ /* emon1.calcVI(20, 2000);
   emon2.calcVI(20, 2000);
-  emon3.calcVI(20, 2000);
+  emon3.calcVI(20, 2000); */
   curr = millis();
   /* if (curr - pre > 1000) {  // checks every seconds
     pre = curr;
@@ -567,4 +626,3 @@ void loop() {
 
 
 // void serverRouter() { }
-
