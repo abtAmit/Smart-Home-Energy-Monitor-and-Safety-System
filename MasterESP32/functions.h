@@ -206,13 +206,13 @@ void WebRequestRouter() {
   // --- MODIFIED: Graph endpoints now use room IDs and no longer send colors ---
   server.on("/graph/today", HTTP_GET, [](AsyncWebServerRequest *request) {
     JsonDocument doc;
-    doc["totalConsumption"] = 17.5 + (random(0, 50) / 10.0);
+    doc["totalConsumption"] = 0 ; //17.5 + (random(0, 50) / 10.0);
     JsonArray rooms = doc["rooms"].to<JsonArray>();
 
     for (size_t i = 0; i < sizeof(roomID); i++) {
       JsonObject room = rooms.add<JsonObject>();
       room["id"] = roomID[i];
-      room["consumption"] = (random(10, 60) / 10.0);
+      room["consumption"] = 0; //(random(10, 60) / 10.0);
     }
     String jsonResponse;
     serializeJson(doc, jsonResponse);
@@ -256,13 +256,16 @@ void WebRequestRouter() {
       for (size_t i = 0; i < sizeof(roomID); i++) {
         JsonObject item = list.add<JsonObject>();
         item["id"] = roomID[i];
-        item["consumption"] = (random(10, 60) / 10.0);
+         item["consumption"] = 0;
+       // item["consumption"] = (random(10, 60) / 10.0);
       }
     } else {
       JsonObject item1 = list.add<JsonObject>();
       item1["name"] = "Main Appliance";
-      item1["consumption"] = (random(10, 30) / 10.0);
-      item1["uptime"] = String(random(1, 12)) + "h " + String(random(1, 60)) + "m";
+       item1["consumption"] = 0;
+      item1["uptime"] = String(0) + "h " + String(0) + "m";
+      // item1["consumption"] = (random(10, 30) / 10.0);
+     //  item1["uptime"] = String(random(1, 12)) + "h " + String(random(1, 60)) + "m";
     }
 
     String jsonResponse;
@@ -281,9 +284,18 @@ void WebRequestRouter() {
 
   server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request) {
     JsonDocument doc;
+     doc["voltage"] = 18+(supplyVoltage/100);
+    doc["pf"] = powerFactor[0];
+    float power=0;
+    for(uint8_t i=0;i<NumberOfNodes;i++){
+      power+=realPower[i];
+    }
+    doc["wattage"] = power;
+    /*
     doc["voltage"] = 220.0 + (random(0, 200) / 10.0) - 10.0;
     doc["pf"] = 0.95 + (random(0, 6) / 100.0) - 0.03;
     doc["wattage"] = 300.0 + random(0, 250);
+    */
     String jsonResponse;
     serializeJson(doc, jsonResponse);
     request->send(200, "application/json", jsonResponse);
@@ -292,13 +304,13 @@ void WebRequestRouter() {
   server.on("/roompower", HTTP_GET, [](AsyncWebServerRequest *request) {
     JsonDocument doc;
     JsonArray array = doc.to<JsonArray>();
-    float voltage = 225.0;
+    float voltage = supplyVoltage;
     for (size_t i = 0; i < sizeof(roomID); i++) {
       JsonObject room = array.add<JsonObject>();
-      float power = 50.0 + random(0, 2000) / 10.0;
+      float power = realPower[i];
       room["id"] = roomID[i];
       room["power"] = power;
-      room["ampere"] = power / voltage;
+      room["ampere"] = Irms[i];
     }
     String jsonResponse;
     serializeJson(doc, jsonResponse);
